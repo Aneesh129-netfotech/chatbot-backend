@@ -13,46 +13,31 @@ from supabase import create_client
 from dotenv import load_dotenv
 from pymongo import MongoClient
 import whisper
+import imageio_ffmpeg
 
-# ------------------------------
-# Ensure ffmpeg/ffprobe available to Whisper (Windows)
-# ------------------------------
-FFMPEG_PATH = r"C:\Users\HP\OneDrive\Desktop\ffmpeg-8.0-full_build\bin\ffmpeg.exe"
-if not os.path.exists(FFMPEG_PATH):
-    raise RuntimeError(f"ffmpeg not found at {FFMPEG_PATH}")
+# FFmpeg via imageio-ffmpeg
+FFMPEG_PATH = imageio_ffmpeg.get_ffmpeg_exe()
+print("🎬 Using FFmpeg from imageio:", FFMPEG_PATH)
 
-# Whisper requires FFmpeg to be discoverable before import
-os.environ["FFMPEG_BINARY"] = FFMPEG_PATH
-os.environ["PATH"] += os.pathsep + os.path.dirname(FFMPEG_PATH)
-
-# ------------------------------
 # Setup Supabase
-# ------------------------------
 load_dotenv()
 SUPABASE_URL = os.getenv("SUPABASE_URL")
 SUPABASE_KEY = os.getenv("SUPABASE_SERVICE_ROLE_KEY")
 BUCKET_NAME = os.getenv("SUPABASE_BUCKET", "interview-audios")
 supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
 
-# ------------------------------
 # Setup MongoDB
-# ------------------------------
 MONGO_URI = os.getenv("MONGO_URL")
 mongo_client = MongoClient(MONGO_URI)
 mongo_db = mongo_client["recruiter-platform"]
 candidates_collection = mongo_db["candidates"]
 interviews_collection = mongo_db["interviews"]
 
-# ------------------------------
 # App Config
-# ------------------------------
 STATIC_DIR = Path("static")
 STATIC_DIR.mkdir(exist_ok=True)
 app = FastAPI(title="Interview Voice Bot Backend")
 
-# ------------------------------
-# CORS
-# ------------------------------
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -61,9 +46,7 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# ------------------------------
 # Whisper (lazy load)
-# ------------------------------
 whisper_model = None
 def get_whisper_model():
     global whisper_model
@@ -73,9 +56,7 @@ def get_whisper_model():
         print("✅ Whisper model ready")
     return whisper_model
 
-# ------------------------------
 # Questions
-# ------------------------------
 QUESTIONS = [
     "How many years of experience do you have?",
     "What is your current CTC?",
@@ -86,12 +67,11 @@ QUESTIONS = [
 ]
 
 class StartRequest(BaseModel):
+    candidate_id: str
     name: str | None = None
     email: str | None = None
 
-# ------------------------------
 # Helper: Convert WebM → WAV
-# ------------------------------
 def convert_to_wav(input_path: str) -> str:
     output_path = input_path.rsplit(".", 1)[0] + ".wav"
     try:
@@ -105,35 +85,36 @@ def convert_to_wav(input_path: str) -> str:
         raise
     return output_path
 
-# ------------------------------
 # Routes
-# ------------------------------
 @app.post("/start_interview")
 async def start_interview(req: StartRequest):
-    # check if candidate already exists by email
-    existing = supabase.table("candidates").select("*").eq("email", req.email).execute()
+    candidate_id = req.candidate_id.strip()
 
-    if existing.data:
-        candidate_id = existing.data[0]["candidate_id"]
-    else:
-        candidate_id = str(uuid.uuid4())  # generate UUID
+    # Check Supabase for this candidate_id
+    existing = supabase.table("candidates").select("*").eq("candidate_id", candidate_id).execute()
 
+    if not existing.data:
+        # Insert if not already in Supabase
         supabase.table("candidates").insert({
             "candidate_id": candidate_id,
             "name": req.name,
             "email": req.email
         }).execute()
 
-        # ✅ sync with Mongo and save candidate_id explicitly
-        candidates_collection.insert_one({
-            "_id": candidate_id,
-            "candidate_id": candidate_id,
-            "name": req.name,
-            "email": req.email
-        })
-        print(f"✅ Candidate saved in Mongo: {candidate_id}, {req.name}, {req.email}")
+        # ✅ Sync to MongoDB
+        candidates_collection.update_one(
+            {"_id": candidate_id},
+            {"$set": {
+                "candidate_id": candidate_id,
+                "name": req.name,
+                "email": req.email
+            }},
+            upsert=True
+        )
 
-    # start session
+        print(f"✅ Candidate synced to Supabase: {candidate_id}")
+
+    # Start interview session
     supabase.table("sessions").insert({
         "candidate_id": candidate_id,
         "q_index": 0
@@ -180,34 +161,29 @@ async def get_question(candidate_id: str):
 
 @app.post("/submit_answer/{candidate_id}/{question_index}")
 async def submit_answer(candidate_id: str, question_index: int, file: UploadFile = File(...)):
-    # Get session
+    candidate_id = candidate_id.strip()  # ✅ ensure clean ID
+
+    # 1. Verify candidate exists in Supabase
+    candidate_check = supabase.table("candidates").select("candidate_id").eq("candidate_id", candidate_id).execute()
+    if not candidate_check.data:
+        raise HTTPException(404, f"Candidate {candidate_id} not found in Supabase")
+
+    # 2. Get session
     session_res = supabase.table("sessions").select("*").eq("candidate_id", candidate_id).execute()
     if not session_res.data:
         raise HTTPException(404, "Session not found")
+
     session = session_res.data[0]
 
-    # Save uploaded audio temporarily
+    # 3. Save uploaded audio temporarily
     tmp_input = tempfile.NamedTemporaryFile(delete=False, suffix=os.path.splitext(file.filename)[1])
     tmp_input.write(await file.read())
     tmp_input.close()
 
-    # Convert WebM → WAV
+    # 4. Convert WebM → WAV
     tmp_wav_path = convert_to_wav(tmp_input.name)
 
-    # Debug audio info
-    try:
-        with wave.open(tmp_wav_path, "rb") as wf:
-            print("🎧 WAV info:", {
-                "channels": wf.getnchannels(),
-                "sample_width": wf.getsampwidth(),
-                "framerate": wf.getframerate(),
-                "nframes": wf.getnframes(),
-                "duration": wf.getnframes() / float(wf.getframerate())
-            })
-    except Exception as e:
-        print("⚠️ Could not read WAV:", e)
-
-    # Transcribe with Whisper
+    # 5. Transcribe with Whisper
     text_answer = ""
     status = "error"
     try:
@@ -217,40 +193,24 @@ async def submit_answer(candidate_id: str, question_index: int, file: UploadFile
         mel = whisper.log_mel_spectrogram(audio).to(model.device)
         options = whisper.DecodingOptions(fp16=False)
         result = whisper.decode(model, mel, options)
-        text_answer = result.text.strip()
-
-        # Retry once if empty
-        if not text_answer:
-            print("⚠️ Empty transcript, retrying with longer padding...")
-            audio = whisper.pad_or_trim(audio, length=30*16000)  # 30s
-            mel = whisper.log_mel_spectrogram(audio).to(model.device)
-            result = whisper.decode(model, mel, options)
-            text_answer = result.text.strip()
-
-        if text_answer:
-            status = "ok"
-        else:
-            text_answer = "(Could not detect speech)"
-            status = "error"
-
-        print("📝 Whisper transcript:", text_answer)
-
+        text_answer = result.text.strip() or "(Could not detect speech)"
+        status = "ok" if result.text.strip() else "error"
     except Exception as e:
         print("❌ Whisper error:", e)
         text_answer = "(Transcription failed)"
         status = "error"
 
-    # Upload original audio
+    # 6. Upload original audio to Supabase Storage
     path_in_bucket = f"{candidate_id}/{uuid.uuid4().hex}{os.path.splitext(file.filename)[1]}"
     with open(tmp_input.name, "rb") as f:
         supabase.storage.from_(BUCKET_NAME).upload(path_in_bucket, f.read())
     audio_url = supabase.storage.from_(BUCKET_NAME).get_public_url(path_in_bucket)
 
-    # Cleanup temp files
+    # 7. Cleanup temp files
     os.remove(tmp_input.name)
     os.remove(tmp_wav_path)
 
-    # ✅ Save user answers in Supabase
+    # 8. Save answer in Supabase
     supabase.table("interviews").insert({
         "candidate_id": candidate_id,
         "question": QUESTIONS[question_index],
@@ -259,7 +219,7 @@ async def submit_answer(candidate_id: str, question_index: int, file: UploadFile
         "answer_audio_url": audio_url
     }).execute()
 
-    # ✅ Also save user answers in Mongo
+    # 9. Save in Mongo too
     interviews_collection.insert_one({
         "candidate_id": candidate_id,
         "question_index": question_index,
@@ -268,9 +228,10 @@ async def submit_answer(candidate_id: str, question_index: int, file: UploadFile
         "status": status,
         "answer_audio_url": audio_url
     })
-    print(f"✅ Answer saved in Mongo for candidate {candidate_id}, Q{question_index}")
 
-    # Move to next question only if transcription succeeded
+    print(f"✅ Answer saved for candidate {candidate_id}, Q{question_index}")
+
+    # 10. Advance session if transcript is valid
     if status == "ok":
         supabase.table("sessions").update(
             {"q_index": session["q_index"] + 1}
@@ -288,9 +249,7 @@ async def finish_interview(candidate_id: str):
     supabase.table("sessions").delete().eq("candidate_id", candidate_id.strip()).execute()
     return {"candidate_id": candidate_id.strip(), "answers": res.data}
 
-# ------------------------------
 # NEW ROUTE: Fetch all questions + answers as transcript
-# ------------------------------
 @app.get("/get_answers/{candidate_id}")
 async def get_answers(candidate_id: str):
     clean_id = candidate_id.strip()  # remove spaces/newlines
@@ -311,7 +270,5 @@ async def get_answers(candidate_id: str):
         "transcript": transcript # formatted Q&A
     }
 
-# ------------------------------
 # Static files
-# ------------------------------
 app.mount("/static", StaticFiles(directory="static"), name="static")
